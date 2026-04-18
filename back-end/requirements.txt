@@ -1,0 +1,7 @@
+fastapi[standard]
+pymongo
+python-dotenv
+redis
+passlib[bcrypt]
+python-jose
+docker
