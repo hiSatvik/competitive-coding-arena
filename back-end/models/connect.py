@@ -7,13 +7,17 @@ load_dotenv()
 MONGO_URL = os.getenv("MONGO_URL")
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME")
 
+
 class Connect:
     def __init__(self):
-        if MONGO_URL:
+        if not MONGO_URL:
             raise ValueError("Mongo URl dosen't exists")
+        if not MONGO_DB_NAME:
+            raise ValueError("Mongo database name doesn't exist")
 
         self.client = MongoClient(MONGO_URL)
-        self.db = self.client(MONGO_DB_NAME)
+        self.db = self.client[MONGO_DB_NAME]
+
 
 try:
     connect = Connect()
