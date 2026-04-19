@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Request
-from controllers.controller import login_user, register_user
+from controllers.auth_controller import login_user, register_user
 from models.schema import UserCreate, UserLogin
 
 router = APIRouter(prefix="/auth", tags=["auth"])

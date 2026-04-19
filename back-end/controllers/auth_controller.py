@@ -1,8 +1,6 @@
 from datetime import datetime, timezone
-
 from fastapi import Request
 from passlib.context import CryptContext
-
 from middleware.auth_middleware import (
     ensure_login_credentials_are_valid,
     ensure_user_does_not_exist,
@@ -10,7 +8,6 @@ from middleware.auth_middleware import (
 from models.connect import connect
 from models.schema import UserCreate, UserLogin
 
-# Use pbkdf2_sha256 so long passwords work without bcrypt's 72-byte limit.
 pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 
 def register_user(payload: UserCreate, request: Request) -> dict:
@@ -39,7 +36,6 @@ def register_user(payload: UserCreate, request: Request) -> dict:
             "email": payload.email,
         },
     }
-
 
 def login_user(payload: UserLogin, request: Request) -> dict:
     user = ensure_login_credentials_are_valid(payload.email, payload.password, pwd_context)

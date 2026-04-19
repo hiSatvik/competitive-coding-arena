@@ -1,7 +1,5 @@
 from fastapi import HTTPException, status
-
 from models.connect import connect
-
 
 def ensure_user_does_not_exist(email: str, username: str) -> None:
     existing_user = connect.db.users.find_one(
