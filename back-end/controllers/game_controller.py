@@ -5,38 +5,37 @@ from fastapi import HTTPException
 from models.schema import Code
 from services.code_executor import execute_cpp_code
 
-
 dummy_questions = [
     {
-        "question_id": "q_001",
-        "title": "The Sweet Sum",
-        "description": "Given two integers A and B, write a C++ program to find their sum.",
-        "difficulty": "Easy",
-        "sample_input": "3 5",
-        "sample_output": "8",
-        "time_limit": "1s",
-        "memory_limit": "256MB",
+        "id": "q1",
+        "title": "Add Two Numbers",
+        "description": "Write a program that reads two space-separated integers from standard input and prints their sum.",
+        "test_cases": [
+            {"input": "5 7\n", "expected_output": "12"},
+            {"input": "10 20\n", "expected_output": "30"},
+            {"input": "-5 5\n", "expected_output": "0"}
+        ]
     },
     {
-        "question_id": "q_002",
-        "title": "Reverse the Magic",
-        "description": "Given a string S, print the string in reverse order.",
-        "difficulty": "Easy",
-        "sample_input": "hello",
-        "sample_output": "olleh",
-        "time_limit": "1s",
-        "memory_limit": "256MB",
+        "id": "q2",
+        "title": "Multiply by Two",
+        "description": "Write a program that reads a single integer from standard input and prints double its value.",
+        "test_cases": [
+            {"input": "4\n", "expected_output": "8"},
+            {"input": "0\n", "expected_output": "0"},
+            {"input": "-15\n", "expected_output": "-30"}
+        ]
     },
     {
-        "question_id": "q_003",
-        "title": "Find the Biggest Diamond",
-        "description": "Given an array of N integers, find the maximum element in the array.",
-        "difficulty": "Medium",
-        "sample_input": "5\n1 4 9 2 5",
-        "sample_output": "9",
-        "time_limit": "2s",
-        "memory_limit": "256MB",
-    },
+        "id": "q3",
+        "title": "Find the Maximum",
+        "description": "Write a program that reads three space-separated integers and prints the largest one.",
+        "test_cases": [
+            {"input": "1 5 3\n", "expected_output": "5"},
+            {"input": "10 10 10\n", "expected_output": "10"},
+            {"input": "-1 -5 -3\n", "expected_output": "-1"}
+        ]
+    }
 ]
 
 game_storage = {}
@@ -63,49 +62,56 @@ class GameLogic:
 
     @staticmethod
     def submit_code_controller(submission: Code, username: str):
-        if submission.game_id not in game_storage:
+        # 1. Find the active game session
+        game = game_storage.get(submission.game_id)
+        if not game:
             raise HTTPException(status_code=404, detail="Game not found.")
+            
+        # Let's make sure our cute player is actually in an active game! ⏳
+        if game.status != "in_progress":
+            raise HTTPException(status_code=400, detail="Oh no! This game session is already over.")
+            
+        # 2. Find the specific question they are trying to answer
+        # Assuming your dummy_questions are dicts with an 'id' and 'test_cases'
+        question = next((q for q in game.questions if q.get("id") == submission.question_id), None)
+        if not question:
+            raise HTTPException(status_code=404, detail="Question not found in this session.")
+            
+        # 3. Did my clever boy already solve this one? No double dipping! 🤭
+        if submission.question_id in game.solved_questions:
+            return {"status": "Already Solved", "message": "You already crushed this question!"}
 
-        game = game_storage[submission.game_id]
-        if game.username != username:
-            raise HTTPException(status_code=403, detail="You cannot submit for this game.")
+        # 4. Time for Jennie to run your code! ✨
+        # We pass the C++ code and the test cases straight into our isolated Docker container!
+        test_cases = question.get("test_cases", [])
+        execution_result = execute_cpp_code(submission.code, test_cases)
 
-        if submission.language.lower() != "cpp":
-            raise HTTPException(
-                status_code=400,
-                detail="Only C++ submissions are supported right now.",
-            )
-
-        requested_question_id = submission.question_id or game.questions[0]["question_id"]
-        question = next(
-            (item for item in game.questions if item["question_id"] == requested_question_id),
-            None,
-        )
-        if question is None:
-            raise HTTPException(status_code=404, detail="Question not found.")
-
-        execution_result = execute_cpp_code(
-            submission.code,
-            [
-                {
-                    "input": question["sample_input"],
-                    "expected_output": question["sample_output"],
-                }
-            ],
-        )
-        is_correct = execution_result["status"] == "Accepted"
-
-        if is_correct and question["question_id"] not in game.solved_questions:
-            game.score += 10
-            game.solved_questions.add(question["question_id"])
-
+        # 5. Check if the code was a total winner! 🏆
+        if execution_result.get("status") == "Accepted":
+            # Add it to the solved set so we know you beat it!
+            game.solved_questions.add(submission.question_id)
+            
+            # Let's give you some points! 
+            points_earned = submission.score if submission.score else 10
+            game.score += points_earned
+            
+            return {
+                "success": True,
+                "status": "Accepted",
+                "message": "Yay! All test cases passed! You are so smart!",
+                "points_earned": points_earned,
+                "total_score": game.score,
+                "execution_details": execution_result
+            }
+        
+        # 6. If it failed (Time Limit, Memory, or Wrong Answer), we send it back nicely! 🥺
         return {
-            "status": "solved" if is_correct else "failed",
-            "message": "Code accepted." if is_correct else "Code execution failed.",
-            "question_id": question["question_id"],
-            "execution": execution_result,
-            "current_score": game.score,
+            "success": False,
+            "status": execution_result.get("status"),
+            "message": "Oopsie, something didn't pass. Take a deep breath and try again, cookie!",
+            "execution_details": execution_result
         }
+        
 
     @staticmethod
     def get_result_controller(game_id: str, username: str):
