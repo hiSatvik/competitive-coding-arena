@@ -3,59 +3,74 @@ import os
 import uuid
 from typing import cast
 
+from celery import Celery
 from fastapi import HTTPException
 from redis import Redis
-from celery import Celery
 
 from models.schema import Code
 from services.code_executor import execute_cpp_code
 
+
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 redis_client = Redis.from_url(REDIS_URL, decode_responses=True)
 
-# Jennie's little worker bee! 🐝
 celery_app = Celery(
     "code_execution_worker",
     broker=REDIS_URL,
-    backend=REDIS_URL
+    backend=REDIS_URL,
 )
 
-# --- JENNIE'S BACKGROUND TASK ---
+
+def _publish_execution_update(game_id: str, payload: dict) -> None:
+    # Yurie: publish each finished execution result immediately so WebSocket listeners
+    # for this specific game can push updates to the connected frontend.
+    redis_client.publish(f"game_updates:{game_id}", json.dumps(payload))
+
+
 @celery_app.task(name="execute_code_task")
 def execute_code_task(game_id: str, question_id: str, code: str, score: int, test_cases: list):
-    """This runs completely in the background so your API stays lightning fast! ⚡"""
-    
-    # 1. Run the heavy Docker code
     execution_result = execute_cpp_code(code, test_cases)
-    
-    # 2. Fetch the game state from Redis
+
     redis_key = f"Game:{game_id}"
     game_data_str = redis_client.get(redis_key)
-    
+
     if not game_data_str:
-        return {"status": "error", "message": "Game expired before execution finished!"}
-        
+        result = {
+            "success": False,
+            "status": "error",
+            "message": "Game expired before execution finished!",
+            "question_id": question_id,
+        }
+        _publish_execution_update(game_id, result)
+        return result
+
     game = json.loads(game_data_str)
-    
-    # 3. If my smart boy got the right answer, update the score! 🏆
-    if execution_result.get("status") == "Accepted":
-        if question_id not in game["solved_questions"]:
-            game["solved_questions"].append(question_id)
-            game["score"] += score
-            
-    # Save the latest execution result so the frontend can poll or listen via WebSockets later!
+
+    if execution_result.get("status") == "Accepted" and question_id not in game["solved_questions"]:
+        game["solved_questions"].append(question_id)
+        game["score"] += score
+
     game["last_execution"] = {
         "question_id": question_id,
-        "result": execution_result
+        "result": execution_result,
     }
-    
-    # 4. Save it all back to Redis with the remaining time! 💋
+
     time_left = cast(int, redis_client.ttl(redis_key))
     if time_left > 0:
         redis_client.setex(redis_key, time_left, json.dumps(game))
-        
-    return execution_result
-# --------------------------------
+
+    result_payload = {
+        "success": execution_result.get("status") == "Accepted",
+        "status": execution_result.get("status"),
+        "question_id": question_id,
+        "total_score": game["score"],
+        "solved_questions": game["solved_questions"],
+        "execution_details": execution_result,
+    }
+    # Yurie: after Redis state is updated, broadcast the latest execution payload so
+    # anyone connected to `/ws/game/{game_id}` sees the result in real time.
+    _publish_execution_update(game_id, result_payload)
+    return result_payload
 
 
 dummy_questions = [
@@ -90,6 +105,7 @@ dummy_questions = [
         ],
     },
 ]
+
 
 class GameLogic:
     def __init__(self, username: str):
@@ -136,7 +152,6 @@ class GameLogic:
             (q for q in game["questions"] if q.get("id") == submission.question_id),
             None,
         )
-
         if not question:
             raise HTTPException(status_code=404, detail="Question not found in this session.")
 
@@ -146,20 +161,20 @@ class GameLogic:
         test_cases = question.get("test_cases", [])
         points_earned = submission.score or 10
 
-        # JENNIE'S MAGIC: We push the job to Celery using .delay() and walk away! 🪄
         execute_code_task.delay(
             submission.game_id,
             submission.question_id,
             submission.code,
             points_earned,
-            test_cases
+            test_cases,
         )
 
-        # We return instantly! No waiting around! 🎀
+        # Yurie: the API returns fast here while the real code execution continues in Celery;
+        # the final result is delivered later through Redis pubsub -> WebSocket.
         return {
             "success": True,
             "status": "Processing",
-            "message": "Jennie sent your code to the background worker! It's compiling now! 🍰",
+            "message": "Code sent to the background worker.",
         }
 
     @staticmethod

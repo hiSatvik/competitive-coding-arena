@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException, Request
 
 from controllers.game_controller import GameLogic
-from models.schema import Code
+from models.schema import Code, GameResultRequest
 
 
 class GameRoutes:
@@ -37,7 +37,7 @@ class GameRoutes:
             return GameLogic.submit_code_controller(payload, username)
 
         @self.router.post("/result")
-        def result_code(payload: Code, request: Request):
+        def result_code(payload: GameResultRequest, request: Request):
             username = self.get_username(request)
             return GameLogic.get_result_controller(payload.game_id, username)
 
