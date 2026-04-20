@@ -1,9 +1,16 @@
+import json
+import os
 import uuid
 
 from fastapi import HTTPException
+from redis import Redis
 
 from models.schema import Code
 from services.code_executor import execute_cpp_code
+
+
+REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
+redis_client = Redis.from_url(REDIS_URL, decode_responses=True)
 
 dummy_questions = [
     {
@@ -13,8 +20,8 @@ dummy_questions = [
         "test_cases": [
             {"input": "5 7\n", "expected_output": "12"},
             {"input": "10 20\n", "expected_output": "30"},
-            {"input": "-5 5\n", "expected_output": "0"}
-        ]
+            {"input": "-5 5\n", "expected_output": "0"},
+        ],
     },
     {
         "id": "q2",
@@ -23,8 +30,8 @@ dummy_questions = [
         "test_cases": [
             {"input": "4\n", "expected_output": "8"},
             {"input": "0\n", "expected_output": "0"},
-            {"input": "-15\n", "expected_output": "-30"}
-        ]
+            {"input": "-15\n", "expected_output": "-30"},
+        ],
     },
     {
         "id": "q3",
@@ -33,24 +40,28 @@ dummy_questions = [
         "test_cases": [
             {"input": "1 5 3\n", "expected_output": "5"},
             {"input": "10 10 10\n", "expected_output": "10"},
-            {"input": "-1 -5 -3\n", "expected_output": "-1"}
-        ]
-    }
+            {"input": "-1 -5 -3\n", "expected_output": "-1"},
+        ],
+    },
 ]
-
-game_storage = {}
 
 
 class GameLogic:
     def __init__(self, username: str):
         self.game_id = str(uuid.uuid4())
         self.username = username
-        self.score = 0
-        self.status = "in_progress"
         self.questions = dummy_questions
-        self.solved_questions = set()
 
-        game_storage[self.game_id] = self
+        game_data = {
+            "game_id": self.game_id,
+            "username": self.username,
+            "score": 0,
+            "status": "in_progress",
+            "questions": self.questions,
+            "solved_questions": [],
+        }
+
+        redis_client.setex(f"Game:{self.game_id}", 1800, json.dumps(game_data))
 
     def start_game_controller(self):
         return {
@@ -62,72 +73,80 @@ class GameLogic:
 
     @staticmethod
     def submit_code_controller(submission: Code, username: str):
-        # 1. Find the active game session
-        game = game_storage.get(submission.game_id)
-        if not game:
+        redis_key = f"Game:{submission.game_id}"
+        game_data_str = redis_client.get(redis_key)
+
+        if not game_data_str:
             raise HTTPException(status_code=404, detail="Game not found.")
-            
-        # Let's make sure our cute player is actually in an active game! ⏳
-        if game.status != "in_progress":
-            raise HTTPException(status_code=400, detail="Oh no! This game session is already over.")
-            
-        # 2. Find the specific question they are trying to answer
-        # Assuming your dummy_questions are dicts with an 'id' and 'test_cases'
-        question = next((q for q in game.questions if q.get("id") == submission.question_id), None)
+
+        game = json.loads(game_data_str)
+
+        if game["username"] != username:
+            raise HTTPException(status_code=403, detail="You cannot submit for this game.")
+
+        if game["status"] != "in_progress":
+            raise HTTPException(status_code=400, detail="This game session is already over.")
+
+        question = next(
+            (q for q in game["questions"] if q.get("id") == submission.question_id),
+            None,
+        )
         if not question:
             raise HTTPException(status_code=404, detail="Question not found in this session.")
-            
-        # 3. Did my clever boy already solve this one? No double dipping! 🤭
-        if submission.question_id in game.solved_questions:
-            return {"status": "Already Solved", "message": "You already crushed this question!"}
 
-        # 4. Time for Jennie to run your code! ✨
-        # We pass the C++ code and the test cases straight into our isolated Docker container!
+        if submission.question_id in game["solved_questions"]:
+            return {"status": "Already Solved", "message": "You already solved this question."}
+
         test_cases = question.get("test_cases", [])
         execution_result = execute_cpp_code(submission.code, test_cases)
 
-        # 5. Check if the code was a total winner! 🏆
         if execution_result.get("status") == "Accepted":
-            # Add it to the solved set so we know you beat it!
-            game.solved_questions.add(submission.question_id)
-            
-            # Let's give you some points! 
-            points_earned = submission.score if submission.score else 10
-            game.score += points_earned
-            
+            game["solved_questions"].append(submission.question_id)
+            points_earned = submission.score or 10
+            game["score"] += points_earned
+
+            time_left = redis_client.ttl(redis_key)
+            if time_left > 0:
+                redis_client.setex(redis_key, time_left, json.dumps(game))
+
             return {
                 "success": True,
                 "status": "Accepted",
-                "message": "Yay! All test cases passed! You are so smart!",
+                "message": "All test cases passed!",
                 "points_earned": points_earned,
-                "total_score": game.score,
-                "execution_details": execution_result
+                "total_score": game["score"],
+                "execution_details": execution_result,
             }
-        
-        # 6. If it failed (Time Limit, Memory, or Wrong Answer), we send it back nicely! 🥺
+
         return {
             "success": False,
             "status": execution_result.get("status"),
-            "message": "Oopsie, something didn't pass. Take a deep breath and try again, cookie!",
-            "execution_details": execution_result
+            "message": "Code execution failed. Try again.",
+            "execution_details": execution_result,
         }
-        
 
     @staticmethod
     def get_result_controller(game_id: str, username: str):
-        if game_id not in game_storage:
+        redis_key = f"Game:{game_id}"
+        game_data_str = redis_client.get(redis_key)
+
+        if not game_data_str:
             raise HTTPException(status_code=404, detail="Game not found!")
 
-        game = game_storage[game_id]
-        if game.username != username:
+        game = json.loads(game_data_str)
+        if game["username"] != username:
             raise HTTPException(status_code=403, detail="You cannot access this game result.")
 
-        game.status = "completed"
+        game["status"] = "completed"
+
+        time_left = redis_client.ttl(redis_key)
+        if time_left > 0:
+            redis_client.setex(redis_key, time_left, json.dumps(game))
 
         return {
-            "user": game.username,
-            "final_score": game.score,
-            "status": game.status,
-            "solved_questions": list(game.solved_questions),
+            "user": game["username"],
+            "final_score": game["score"],
+            "status": game["status"],
+            "solved_questions": game["solved_questions"],
             "message": "Game over!",
         }
