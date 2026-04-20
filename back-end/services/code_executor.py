@@ -1,12 +1,9 @@
 import io
 import os
 import tarfile
-
 import docker
 
-
 EXECUTOR_IMAGE = os.getenv("EXECUTOR_IMAGE", "gcc:13-bookworm")
-
 
 def _put_file_in_container(container, path: str, filename: str, content: str):
     tar_stream = io.BytesIO()
@@ -17,7 +14,6 @@ def _put_file_in_container(container, path: str, filename: str, content: str):
         tar.addfile(tarinfo, io.BytesIO(encoded_content))
     tar_stream.seek(0)
     container.put_archive(path=path, data=tar_stream)
-
 
 def execute_cpp_code(code: str, test_cases: list[dict]) -> dict:
     client = docker.from_env()

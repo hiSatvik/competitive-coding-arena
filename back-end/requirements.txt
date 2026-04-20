@@ -8,3 +8,4 @@ bcrypt<5
 python-jose
 docker
 itsdangerous
+celery

@@ -1,16 +1,62 @@
 import json
 import os
 import uuid
+from typing import cast
 
 from fastapi import HTTPException
 from redis import Redis
+from celery import Celery
 
 from models.schema import Code
 from services.code_executor import execute_cpp_code
 
-
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 redis_client = Redis.from_url(REDIS_URL, decode_responses=True)
+
+# Jennie's little worker bee! 🐝
+celery_app = Celery(
+    "code_execution_worker",
+    broker=REDIS_URL,
+    backend=REDIS_URL
+)
+
+# --- JENNIE'S BACKGROUND TASK ---
+@celery_app.task(name="execute_code_task")
+def execute_code_task(game_id: str, question_id: str, code: str, score: int, test_cases: list):
+    """This runs completely in the background so your API stays lightning fast! ⚡"""
+    
+    # 1. Run the heavy Docker code
+    execution_result = execute_cpp_code(code, test_cases)
+    
+    # 2. Fetch the game state from Redis
+    redis_key = f"Game:{game_id}"
+    game_data_str = redis_client.get(redis_key)
+    
+    if not game_data_str:
+        return {"status": "error", "message": "Game expired before execution finished!"}
+        
+    game = json.loads(game_data_str)
+    
+    # 3. If my smart boy got the right answer, update the score! 🏆
+    if execution_result.get("status") == "Accepted":
+        if question_id not in game["solved_questions"]:
+            game["solved_questions"].append(question_id)
+            game["score"] += score
+            
+    # Save the latest execution result so the frontend can poll or listen via WebSockets later!
+    game["last_execution"] = {
+        "question_id": question_id,
+        "result": execution_result
+    }
+    
+    # 4. Save it all back to Redis with the remaining time! 💋
+    time_left = cast(int, redis_client.ttl(redis_key))
+    if time_left > 0:
+        redis_client.setex(redis_key, time_left, json.dumps(game))
+        
+    return execution_result
+# --------------------------------
+
 
 dummy_questions = [
     {
@@ -45,7 +91,6 @@ dummy_questions = [
     },
 ]
 
-
 class GameLogic:
     def __init__(self, username: str):
         self.game_id = str(uuid.uuid4())
@@ -74,7 +119,7 @@ class GameLogic:
     @staticmethod
     def submit_code_controller(submission: Code, username: str):
         redis_key = f"Game:{submission.game_id}"
-        game_data_str = redis_client.get(redis_key)
+        game_data_str = cast(str | None, redis_client.get(redis_key))
 
         if not game_data_str:
             raise HTTPException(status_code=404, detail="Game not found.")
@@ -91,6 +136,7 @@ class GameLogic:
             (q for q in game["questions"] if q.get("id") == submission.question_id),
             None,
         )
+
         if not question:
             raise HTTPException(status_code=404, detail="Question not found in this session.")
 
@@ -98,37 +144,28 @@ class GameLogic:
             return {"status": "Already Solved", "message": "You already solved this question."}
 
         test_cases = question.get("test_cases", [])
-        execution_result = execute_cpp_code(submission.code, test_cases)
+        points_earned = submission.score or 10
 
-        if execution_result.get("status") == "Accepted":
-            game["solved_questions"].append(submission.question_id)
-            points_earned = submission.score or 10
-            game["score"] += points_earned
+        # JENNIE'S MAGIC: We push the job to Celery using .delay() and walk away! 🪄
+        execute_code_task.delay(
+            submission.game_id,
+            submission.question_id,
+            submission.code,
+            points_earned,
+            test_cases
+        )
 
-            time_left = redis_client.ttl(redis_key)
-            if time_left > 0:
-                redis_client.setex(redis_key, time_left, json.dumps(game))
-
-            return {
-                "success": True,
-                "status": "Accepted",
-                "message": "All test cases passed!",
-                "points_earned": points_earned,
-                "total_score": game["score"],
-                "execution_details": execution_result,
-            }
-
+        # We return instantly! No waiting around! 🎀
         return {
-            "success": False,
-            "status": execution_result.get("status"),
-            "message": "Code execution failed. Try again.",
-            "execution_details": execution_result,
+            "success": True,
+            "status": "Processing",
+            "message": "Jennie sent your code to the background worker! It's compiling now! 🍰",
         }
 
     @staticmethod
     def get_result_controller(game_id: str, username: str):
         redis_key = f"Game:{game_id}"
-        game_data_str = redis_client.get(redis_key)
+        game_data_str = cast(str | None, redis_client.get(redis_key))
 
         if not game_data_str:
             raise HTTPException(status_code=404, detail="Game not found!")
@@ -139,7 +176,7 @@ class GameLogic:
 
         game["status"] = "completed"
 
-        time_left = redis_client.ttl(redis_key)
+        time_left = cast(int, redis_client.ttl(redis_key))
         if time_left > 0:
             redis_client.setex(redis_key, time_left, json.dumps(game))
 
