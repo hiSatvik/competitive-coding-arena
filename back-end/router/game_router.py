@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException, Request
 
 from controllers.game_controller import GameLogic
-from models.schema import Code, GameResultRequest, JoinRoomRequest
+from models.schema import Code, GameResultRequest, JoinRoomRequest, RoomSubmitRequest
 
 import random
 import string
@@ -67,9 +67,11 @@ class GameRoutes:
         @self.router.post(f"/start-room/")
         def start_room(payload: JoinRoomRequest, request: Request):
             return GameLogic.start_room_controller(payload.room_code)
-
-
         
+        @self.router.post("/room-submit")
+        def room_submit_code(payload: RoomSubmitRequest, request: Request):
+            username = self.get_or_create_username(request)
+            return GameLogic.submit_room_controller(payload, username)  
 
 game_routes = GameRoutes()
 router = game_routes.router

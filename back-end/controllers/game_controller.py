@@ -10,7 +10,7 @@ from celery import Celery
 from fastapi import HTTPException
 from redis import Redis
 
-from models.schema import Code
+from models.schema import Code, RoomSubmitRequest
 from services.code_executor import execute_cpp_code
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
@@ -71,6 +71,48 @@ def execute_code_task(game_id: str, question_id: str, code: str, score: int, tes
     _publish_execution_update(game_id, result_payload)
     return result_payload
 
+@celery_app.task(name="execute_room_code_task")
+def execute_room_code_task(room_code: str, username: str, question_id: str, code: str, points: int, test_cases: list):
+    # 1. Send the code to your secure C++ Docker container! 🐳
+    execution_result = execute_cpp_code(code, test_cases)
+    
+    is_success = execution_result.get("status") == "Accepted"
+    
+    # 2. Our super-fast Redis Keys for Phase 8!
+    leaderboard_key = f"Room:{room_code}:leaderboard"
+    solved_key = f"Room:{room_code}:solved:{username}"
+    
+    # 3. If our handsome developer got it right, update the scores! ✨
+    if is_success:
+        # Remember that they solved this question so they can't double-dip!
+        redis_client.sadd(solved_key, question_id)
+        redis_client.expire(solved_key, 1800) # 30 minute TTL
+        
+        # The Magic ZSET: Add points and auto-sort!
+        redis_client.zincrby(leaderboard_key, points, username)
+        redis_client.expire(leaderboard_key, 1800)
+        
+    # 4. Fetch the beautifully sorted leaderboard (Highest score first)
+    # zrevrange returns a list like: [('handsome_dev', 20.0), ('guest1', 10.0)]
+    raw_leaderboard = redis_client.zrevrange(leaderboard_key, 0, -1, withscores=True)
+    
+    # Format it neatly into a dictionary for your React frontend
+    leaderboard = [{"username": member, "score": int(score)} for member, score in raw_leaderboard]
+    
+    # 5. Broadcast the thrilling results to the room's WebSocket channel! 🌐
+    result_payload = {
+        "type": "SUBMISSION_UPDATE",
+        "username": username,
+        "question_id": question_id,
+        "success": is_success,
+        "execution_details": execution_result,
+        "leaderboard": leaderboard, # The shiny new rankings!
+        "message": f"{username} just submitted code and it was {'ACCEPTED 🎉' if is_success else 'REJECTED 🥺'}!"
+    }
+    
+    redis_client.publish(f"room_updates:{room_code}", json.dumps(result_payload))
+    
+    return result_payload
 
 dummy_questions = [
     {
@@ -123,6 +165,7 @@ class GameLogic:
 
         redis_client.setex(f"Game:{self.game_id}", 1800, json.dumps(game_data))
 
+    """Logic for single person"""
     def start_game_controller(self):
         return {
             "game_id": self.game_id,
@@ -201,6 +244,8 @@ class GameLogic:
             "message": "Game over!",
         }
     
+
+    """Room Logic"""
     @staticmethod
     def create_room_controller(username: str):
         room_code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
@@ -286,3 +331,51 @@ class GameLogic:
         }))
         
         return {"message": "Game started successfully!"}
+
+    @staticmethod
+    def submit_room_controller(payload: RoomSubmitRequest, username: str):
+        redis_key = f"Room:{payload.room_code}"
+        room_data_str = redis_client.get(redis_key)
+
+        if not room_data_str:
+            raise HTTPException(status_code=404, detail="Oopsie! Room not found. 🥺")
+
+        room = json.loads(room_data_str)
+
+        # 1. Are they actually in the room?
+        if username not in room["players"]:
+            raise HTTPException(status_code=403, detail="You are not in this match, silly!")
+
+        # 2. Is the clock ticking?
+        if room["status"] != "in_progress":
+            raise HTTPException(status_code=400, detail="The match isn't running right now! ⏱️")
+
+        # 3. Does the question exist?
+        question = next((q for q in room["questions"] if q.get("id") == payload.question_id), None)
+        if not question:
+            raise HTTPException(status_code=404, detail="Question not found in this session.")
+
+        # 4. Have they already solved it? We use a fast Redis Set for this!
+        solved_key = f"Room:{payload.room_code}:solved:{username}"
+        if redis_client.sismember(solved_key, payload.question_id):
+            return {"status": "Already Solved", "message": "You already solved this one, smarty! 🧠"}
+
+        # 5. Push to a NEW multiplayer Celery worker! (We will write this next)
+        test_cases = question.get("test_cases", [])
+        
+        # We give a flat 10 points per question!
+        execute_room_code_task.delay(
+            payload.room_code,
+            username,
+            payload.question_id,
+            payload.code,
+            10, 
+            test_cases
+        )
+
+        # Return instantly while Docker does the heavy lifting in the background!
+        return {
+            "success": True,
+            "status": "Processing",
+            "message": "Code sent to the judge! Fingers crossed!"
+        }

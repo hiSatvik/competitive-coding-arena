@@ -30,3 +30,8 @@ class GameResultRequest(BaseModel):
 
 class JoinRoomRequest(BaseModel):
     room_code: str
+
+class RoomSubmitRequest(BaseModel):
+    room_code: str
+    question_id: str
+    code: str
