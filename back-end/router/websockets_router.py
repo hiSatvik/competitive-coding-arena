@@ -47,3 +47,13 @@ async def listen_to_redis_pubsub():
             game_id = channel.split(":", 1)[1]
             data = json.loads(message["data"])
             await manager.broadcast_to_game(data, game_id)
+
+@router.websocket("/ws/room/{room_code}")
+async def room_websocket_endpoint(websocket: WebSocket, room_code: str):
+    await manager.connect(websocket, room_code)
+
+    try:
+        while True:
+            data = await websocket.receive_text()
+    except:
+        manager.disconnect(websocket, room_code)

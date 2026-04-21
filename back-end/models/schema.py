@@ -27,3 +27,6 @@ class Code(BaseModel):
 
 class GameResultRequest(BaseModel):
     game_id: str
+
+class JoinRoomRequest(BaseModel):
+    room_code: str

@@ -2,6 +2,9 @@ import json
 import os
 import uuid
 from typing import cast
+import random
+import string
+import time
 
 from celery import Celery
 from fastapi import HTTPException
@@ -9,7 +12,6 @@ from redis import Redis
 
 from models.schema import Code
 from services.code_executor import execute_cpp_code
-
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 redis_client = Redis.from_url(REDIS_URL, decode_responses=True)
@@ -22,8 +24,6 @@ celery_app = Celery(
 
 
 def _publish_execution_update(game_id: str, payload: dict) -> None:
-    # Yurie: publish each finished execution result immediately so WebSocket listeners
-    # for this specific game can push updates to the connected frontend.
     redis_client.publish(f"game_updates:{game_id}", json.dumps(payload))
 
 
@@ -67,8 +67,7 @@ def execute_code_task(game_id: str, question_id: str, code: str, score: int, tes
         "solved_questions": game["solved_questions"],
         "execution_details": execution_result,
     }
-    # Yurie: after Redis state is updated, broadcast the latest execution payload so
-    # anyone connected to `/ws/game/{game_id}` sees the result in real time.
+
     _publish_execution_update(game_id, result_payload)
     return result_payload
 
@@ -169,7 +168,6 @@ class GameLogic:
             test_cases,
         )
 
-        # Yurie: the API returns fast here while the real code execution continues in Celery;
         # the final result is delivered later through Redis pubsub -> WebSocket.
         return {
             "success": True,
@@ -202,3 +200,89 @@ class GameLogic:
             "solved_questions": game["solved_questions"],
             "message": "Game over!",
         }
+    
+    @staticmethod
+    def create_room_controller(username: str):
+        room_code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
+
+        question = dummy_questions
+
+        room_data = {
+            "room_code": room_code,
+            "status": "waiting",
+            "players": [username],
+            "questions": question,
+            "start_time": None
+        }
+
+        redis_client.setex(f"Room:{room_code}", 1800, json.dumps(room_data))
+
+        return {
+            "room_code": room_code,
+            "username": username,
+            "questions": question,
+            "message": f"Room created successfully! Share {room_code} to invite users. 🎀"
+        }
+    
+    @staticmethod
+    def join_room_controller(room_code: str, username: str):
+        redis_key = f"Room:{room_code}" 
+
+        room_data_str = redis_client.get(redis_key)
+
+        # If it's completely missing from Redis
+        if not room_data_str:
+            raise HTTPException(status_code=404, detail="Oops! Room not found. 🥺")
+        
+        room = json.loads(room_data_str)
+
+        # Check if the game has already started before letting them in!
+        if room["status"] != "waiting":
+            raise HTTPException(status_code=400, detail="Oh no! The game has already started! 🏃‍♂️")
+
+        if username not in room["players"]:
+            room["players"].append(username)
+
+            time_left = cast(int, redis_client.ttl(redis_key))
+
+            if time_left > 0:
+                redis_client.setex(redis_key, time_left, json.dumps(room))
+
+        return {
+            "room_code": room_code,
+            "username": username,
+            "players": room["players"],
+            "questions": room["questions"],
+            "message": "Welcome to the party!"
+        }
+    
+    @staticmethod
+    def start_room_controller(room_code: str):
+        redis_key = f"Room:{room_code}"
+        room_data_str = redis_client.get(redis_key)
+        
+        if not room_data_str:
+            raise HTTPException(status_code=404, detail="Oopsie! Room not found. 🥺")
+            
+        room = json.loads(room_data_str)
+        
+        if room["status"] != "waiting":
+            raise HTTPException(status_code=400, detail="The timer is already ticking! 🏃‍♂️")
+            
+        # Start the clock!
+        room["status"] = "in_progress"
+        room["start_time"] = int(time.time()) # Record the exact second it started
+        
+        # Save the updated status back to Redis
+        time_left = cast(int, redis_client.ttl(redis_key))
+        if time_left > 0:
+            redis_client.setex(redis_key, time_left, json.dumps(room))
+            
+        # Jennie's special trick: Broadcast to the WebSocket that the game has started!
+        redis_client.publish(f"room_updates:{room_code}", json.dumps({
+            "type": "GAME_STARTED",
+            "start_time": room["start_time"],
+            "message": "Buckle up, developers! The match has begun! 🚀"
+        }))
+        
+        return {"message": "Game started successfully!"}
