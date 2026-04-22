@@ -1,5 +1,7 @@
 import { RouterProvider, createBrowserRouter } from "react-router-dom";
-import RegisterForm from "./pages/Login";
+import RegisterForm from "./pages/LoginPage/Login";
+import Lobby from "./pages/Lobby/Lobby";
+import Arena from "./pages/Arena/Arena";
 
 export default function App() {
   const router = createBrowserRouter([
@@ -10,6 +12,14 @@ export default function App() {
     {
       path: "/login",
       element: <RegisterForm type={"login"} />
+    },
+    {
+      path: "/lobby",
+      element: <Lobby />
+    },
+    {
+      path: "/arena/solo/:gameId", 
+      element: <Arena />
     }
   ])
 
