@@ -23,12 +23,12 @@ export default function ProblemPanel({ problem }) {
           </ul>
   
           <h3 className="text-xl text-pink-500 mt-8 mb-4 font-orbitron">Examples</h3>
-          {problem.examples?.map((ex, i) => (
+          {problem.test_cases?.map((ex, i) => (
             <div key={i} className="mb-4 p-4 bg-white/5 rounded-lg border border-white/10 font-mono text-sm">
               <div className="text-white/50 mb-1">Input:</div>
               <div className="mb-3 text-white">{ex.input}</div>
               <div className="text-white/50 mb-1">Output:</div>
-              <div className="text-white">{ex.output}</div>
+              <div className="text-white">{ex.expected_output}</div>
             </div>
           ))}
         </div>

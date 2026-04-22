@@ -71,7 +71,11 @@ class GameRoutes:
         @self.router.post("/room-submit")
         def room_submit_code(payload: RoomSubmitRequest, request: Request):
             username = self.get_or_create_username(request)
-            return GameLogic.submit_room_controller(payload, username)  
+            return GameLogic.submit_room_controller(payload, username)
+        
+        @self.router.get("/problems")
+        def get_problems():
+            return GameLogic.send_problems();
 
 game_routes = GameRoutes()
 router = game_routes.router
