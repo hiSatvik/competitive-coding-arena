@@ -1,17 +1,16 @@
-    import axios from "axios"
+import axios from "axios";
 
-    export const executeCode = async (code, problem, game_id, score) => {
-        const payload = {
-            "game_id": game_id,
-            "code": code,
-            "question_id": problem.id,
-            "score": score
-        }
+export const executeCode = async (code, questionId, gameId, action = "run") => {
+    const response = await axios.post(
+        "http://localhost:8000/game/submit",
+        {
+            code,
+            question_id: questionId,
+            game_id: gameId,
+            action,
+        },
+        { withCredentials: true }
+    );
 
-        const result = await axios.post("http://localhost:8000/game/submit", payload,
-            { withCredentials: true });
-        
-        console.log(result.data);
-
-        return result.data;
-    }
+    return response.data;
+};

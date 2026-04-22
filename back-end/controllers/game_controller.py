@@ -285,27 +285,51 @@ class GameLogic:
 
         if submission.question_id in game["solved_questions"]:
             return {
+                "success": True,
                 "status": "Already Solved",
                 "message": "You already solved this question.",
+                "question_id": submission.question_id,
+                "total_score": game["score"],
+                "execution_details": {"status": "Accepted", "results": []},
             }
 
         test_cases = question.get("test_cases", [])
-        points_earned = submission.score or 10
+        points_earned = 10
 
-        execute_code_task.delay(
-            submission.game_id,
-            submission.question_id,
-            submission.code,
-            points_earned,
-            test_cases,
-        )
+        execution_result = execute_cpp_code(submission.code, test_cases)
+        is_submit = submission.action == "submit"
 
-        # the final result is delivered later through Redis pubsub -> WebSocket.
-        return {
-            "success": True,
-            "status": "Processing",
-            "message": "Code sent to the background worker.",
+        if (
+            is_submit
+            and
+            execution_result.get("status") == "Accepted"
+            and submission.question_id not in game["solved_questions"]
+        ):
+            game["solved_questions"].append(submission.question_id)
+            game["score"] += points_earned
+
+        game["last_execution"] = {
+            "question_id": submission.question_id,
+            "result": execution_result,
         }
+
+        time_left = cast(int, redis_client.ttl(redis_key))
+        if time_left > 0:
+            redis_client.setex(redis_key, time_left, json.dumps(game))
+
+        result_payload = {
+            "success": execution_result.get("status") == "Accepted",
+            "status": execution_result.get("status"),
+            "message": "Submission accepted." if is_submit and execution_result.get("status") == "Accepted" else "Execution finished.",
+            "question_id": submission.question_id,
+            "total_score": game["score"],
+            "solved_questions": game["solved_questions"],
+            "execution_details": execution_result,
+            "action": submission.action,
+        }
+
+        _publish_execution_update(submission.game_id, result_payload)
+        return result_payload
 
     @staticmethod
     def get_result_controller(game_id: str, username: str):

@@ -10,7 +10,7 @@ export default function ProblemPanel({ problem }) {
             {problem.difficulty}
           </span>
           <span className="px-3 py-1 bg-white/5 rounded border border-white/10">
-            Time Limit: {problem.timeLimit}s
+            Time Limit: {problem.timeLimit ?? problem.time_limit ?? 1}s
           </span>
         </div>
   

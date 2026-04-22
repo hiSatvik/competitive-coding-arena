@@ -24,6 +24,7 @@ class Code(BaseModel):
     question_id: str | None = None
     language: str = "cpp"
     score: int | None = None
+    action: str = "run"
 
 class GameResultRequest(BaseModel):
     game_id: str
