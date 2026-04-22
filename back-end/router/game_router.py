@@ -62,11 +62,16 @@ class GameRoutes:
         @self.router.post("/join-room")
         def join_room(payload: JoinRoomRequest, request: Request):
             username = self.get_or_create_username(request)
-            return GameLogic.join_room_controller(payload, username)
+            return GameLogic.join_room_controller(payload.room_code, username)
         
         @self.router.post(f"/start-room/")
         def start_room(payload: JoinRoomRequest, request: Request):
             return GameLogic.start_room_controller(payload.room_code)
+
+        @self.router.get("/room/{room_code}")
+        def get_room(room_code: str, request: Request):
+            username = self.get_or_create_username(request)
+            return GameLogic.get_room_controller(room_code, username)
         
         @self.router.post("/room-submit")
         def room_submit_code(payload: RoomSubmitRequest, request: Request):

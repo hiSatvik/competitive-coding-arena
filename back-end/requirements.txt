@@ -9,3 +9,4 @@ python-jose
 docker
 itsdangerous
 celery
+google

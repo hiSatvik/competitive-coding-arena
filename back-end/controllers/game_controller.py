@@ -1,10 +1,11 @@
 import json
 import os
-import uuid
-from typing import cast
 import random
 import string
+import threading
 import time
+import uuid
+from typing import cast
 
 from celery import Celery
 from fastapi import HTTPException
@@ -12,6 +13,7 @@ from redis import Redis
 
 from models.schema import Code, RoomSubmitRequest
 from services.code_executor import execute_cpp_code
+
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 redis_client = Redis.from_url(REDIS_URL, decode_responses=True)
@@ -22,9 +24,15 @@ celery_app = Celery(
     backend=REDIS_URL,
 )
 
+ROOM_JOIN_WINDOW_SECONDS = 120
+
 
 def _publish_execution_update(game_id: str, payload: dict) -> None:
     redis_client.publish(f"game_updates:{game_id}", json.dumps(payload))
+
+
+def _publish_room_update(room_code: str, payload: dict) -> None:
+    redis_client.publish(f"room_updates:{room_code}", json.dumps(payload))
 
 
 @celery_app.task(name="execute_code_task")
@@ -86,47 +94,35 @@ def execute_room_code_task(
     points: int,
     test_cases: list,
 ):
-    # 1. Send the code to your secure C++ Docker container! 🐳
     execution_result = execute_cpp_code(code, test_cases)
-
     is_success = execution_result.get("status") == "Accepted"
 
-    # 2. Our super-fast Redis Keys for Phase 8!
     leaderboard_key = f"Room:{room_code}:leaderboard"
     solved_key = f"Room:{room_code}:solved:{username}"
 
-    # 3. If our handsome developer got it right, update the scores! ✨
     if is_success:
-        # Remember that they solved this question so they can't double-dip!
         redis_client.sadd(solved_key, question_id)
-        redis_client.expire(solved_key, 1800)  # 30 minute TTL
+        redis_client.expire(solved_key, 1800)
 
-        # The Magic ZSET: Add points and auto-sort!
         redis_client.zincrby(leaderboard_key, points, username)
         redis_client.expire(leaderboard_key, 1800)
 
-    # 4. Fetch the beautifully sorted leaderboard (Highest score first)
-    # zrevrange returns a list like: [('handsome_dev', 20.0), ('guest1', 10.0)]
     raw_leaderboard = redis_client.zrevrange(leaderboard_key, 0, -1, withscores=True)
-
-    # Format it neatly into a dictionary for your React frontend
     leaderboard = [
         {"username": member, "score": int(score)} for member, score in raw_leaderboard
     ]
 
-    # 5. Broadcast the thrilling results to the room's WebSocket channel! 🌐
     result_payload = {
         "type": "SUBMISSION_UPDATE",
         "username": username,
         "question_id": question_id,
         "success": is_success,
         "execution_details": execution_result,
-        "leaderboard": leaderboard,  # The shiny new rankings!
-        "message": f"{username} just submitted code and it was {'ACCEPTED 🎉' if is_success else 'REJECTED 🥺'}!",
+        "leaderboard": leaderboard,
+        "message": f"{username} just submitted code and it was {'ACCEPTED' if is_success else 'REJECTED'}!",
     }
 
-    redis_client.publish(f"room_updates:{room_code}", json.dumps(result_payload))
-
+    _publish_room_update(room_code, result_payload)
     return result_payload
 
 
@@ -244,8 +240,6 @@ class GameLogic:
 
         redis_client.setex(f"Game:{self.game_id}", 1800, json.dumps(game_data))
 
-    """Logic for single person"""
-
     def start_game_controller(self):
         return {
             "game_id": self.game_id,
@@ -265,23 +259,17 @@ class GameLogic:
         game = json.loads(game_data_str)
 
         if game["username"] != username:
-            raise HTTPException(
-                status_code=403, detail="You cannot submit for this game."
-            )
+            raise HTTPException(status_code=403, detail="You cannot submit for this game.")
 
         if game["status"] != "in_progress":
-            raise HTTPException(
-                status_code=400, detail="This game session is already over."
-            )
+            raise HTTPException(status_code=400, detail="This game session is already over.")
 
         question = next(
             (q for q in game["questions"] if q.get("id") == submission.question_id),
             None,
         )
         if not question:
-            raise HTTPException(
-                status_code=404, detail="Question not found in this session."
-            )
+            raise HTTPException(status_code=404, detail="Question not found in this session.")
 
         if submission.question_id in game["solved_questions"]:
             return {
@@ -301,8 +289,7 @@ class GameLogic:
 
         if (
             is_submit
-            and
-            execution_result.get("status") == "Accepted"
+            and execution_result.get("status") == "Accepted"
             and submission.question_id not in game["solved_questions"]
         ):
             game["solved_questions"].append(submission.question_id)
@@ -320,7 +307,9 @@ class GameLogic:
         result_payload = {
             "success": execution_result.get("status") == "Accepted",
             "status": execution_result.get("status"),
-            "message": "Submission accepted." if is_submit and execution_result.get("status") == "Accepted" else "Execution finished.",
+            "message": "Submission accepted."
+            if is_submit and execution_result.get("status") == "Accepted"
+            else "Execution finished.",
             "question_id": submission.question_id,
             "total_score": game["score"],
             "solved_questions": game["solved_questions"],
@@ -341,9 +330,7 @@ class GameLogic:
 
         game = json.loads(game_data_str)
         if game["username"] != username:
-            raise HTTPException(
-                status_code=403, detail="You cannot access this game result."
-            )
+            raise HTTPException(status_code=403, detail="You cannot access this game result.")
 
         game["status"] = "completed"
 
@@ -359,63 +346,107 @@ class GameLogic:
             "message": "Game over!",
         }
 
-    """Room Logic"""
-
     @staticmethod
     def create_room_controller(username: str):
         room_code = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
-
-        question = dummy_questions
+        join_deadline = int(time.time()) + ROOM_JOIN_WINDOW_SECONDS
 
         room_data = {
             "room_code": room_code,
             "status": "waiting",
             "players": [username],
-            "questions": question,
+            "questions": dummy_questions,
             "start_time": None,
+            "join_deadline": join_deadline,
         }
 
         redis_client.setex(f"Room:{room_code}", 1800, json.dumps(room_data))
+        threading.Thread(
+            target=GameLogic._auto_start_room_after_deadline,
+            args=(room_code,),
+            daemon=True,
+        ).start()
 
         return {
             "room_code": room_code,
             "username": username,
-            "questions": question,
-            "message": f"Room created successfully! Share {room_code} to invite users. 🎀",
+            "players": room_data["players"],
+            "questions": room_data["questions"],
+            "status": room_data["status"],
+            "join_deadline": join_deadline,
+            "message": f"Room created successfully! Share {room_code} to invite users.",
         }
 
     @staticmethod
     def join_room_controller(room_code: str, username: str):
         redis_key = f"Room:{room_code}"
-
         room_data_str = redis_client.get(redis_key)
 
-        # If it's completely missing from Redis
         if not room_data_str:
-            raise HTTPException(status_code=404, detail="Oops! Room not found. 🥺")
+            raise HTTPException(status_code=404, detail="Room not found.")
 
         room = json.loads(room_data_str)
+        room = GameLogic._ensure_room_started_if_ready(room_code, room)
 
-        # Check if the game has already started before letting them in!
         if room["status"] != "waiting":
-            raise HTTPException(
-                status_code=400, detail="Oh no! The game has already started! 🏃‍♂️"
-            )
+            return {
+                "room_code": room["room_code"],
+                "username": username,
+                "players": room["players"],
+                "questions": room["questions"],
+                "status": room["status"],
+                "join_deadline": room.get("join_deadline"),
+                "start_time": room.get("start_time"),
+                "message": "The game has already started.",
+            }
 
         if username not in room["players"]:
             room["players"].append(username)
 
             time_left = cast(int, redis_client.ttl(redis_key))
-
             if time_left > 0:
                 redis_client.setex(redis_key, time_left, json.dumps(room))
+
+            _publish_room_update(
+                room_code,
+                {
+                    "type": "PLAYER_JOINED",
+                    "room_code": room_code,
+                    "players": room["players"],
+                    "status": room["status"],
+                    "join_deadline": room.get("join_deadline"),
+                },
+            )
 
         return {
             "room_code": room_code,
             "username": username,
             "players": room["players"],
             "questions": room["questions"],
-            "message": "Welcome to the party!",
+            "status": room["status"],
+            "join_deadline": room.get("join_deadline"),
+            "start_time": room.get("start_time"),
+            "message": "Welcome to the room!",
+        }
+
+    @staticmethod
+    def get_room_controller(room_code: str, username: str):
+        redis_key = f"Room:{room_code}"
+        room_data_str = redis_client.get(redis_key)
+
+        if not room_data_str:
+            raise HTTPException(status_code=404, detail="Room not found.")
+
+        room = json.loads(room_data_str)
+        room = GameLogic._ensure_room_started_if_ready(room_code, room)
+        return {
+            "room_code": room["room_code"],
+            "username": username,
+            "players": room["players"],
+            "questions": room["questions"],
+            "status": room["status"],
+            "join_deadline": room.get("join_deadline"),
+            "start_time": room.get("start_time"),
         }
 
     @staticmethod
@@ -424,37 +455,77 @@ class GameLogic:
         room_data_str = redis_client.get(redis_key)
 
         if not room_data_str:
-            raise HTTPException(status_code=404, detail="Oopsie! Room not found. 🥺")
+            raise HTTPException(status_code=404, detail="Room not found.")
 
         room = json.loads(room_data_str)
 
         if room["status"] != "waiting":
-            raise HTTPException(
-                status_code=400, detail="The timer is already ticking! 🏃‍♂️"
-            )
+            raise HTTPException(status_code=400, detail="The room has already started.")
 
-        # Start the clock!
         room["status"] = "in_progress"
-        room["start_time"] = int(time.time())  # Record the exact second it started
+        room["start_time"] = int(time.time())
 
-        # Save the updated status back to Redis
         time_left = cast(int, redis_client.ttl(redis_key))
         if time_left > 0:
             redis_client.setex(redis_key, time_left, json.dumps(room))
 
-        # Jennie's special trick: Broadcast to the WebSocket that the game has started!
-        redis_client.publish(
-            f"room_updates:{room_code}",
-            json.dumps(
-                {
-                    "type": "GAME_STARTED",
-                    "start_time": room["start_time"],
-                    "message": "Buckle up, developers! The match has begun! 🚀",
-                }
-            ),
+        _publish_room_update(
+            room_code,
+            {
+                "type": "GAME_STARTED",
+                "room_code": room_code,
+                "players": room["players"],
+                "questions": room["questions"],
+                "start_time": room["start_time"],
+                "message": "The room match has started!",
+            },
         )
 
         return {"message": "Game started successfully!"}
+
+    @staticmethod
+    def _auto_start_room_after_deadline(room_code: str):
+        redis_key = f"Room:{room_code}"
+
+        while True:
+            room_data_str = redis_client.get(redis_key)
+            if not room_data_str:
+                return
+
+            room = json.loads(room_data_str)
+            if room["status"] != "waiting":
+                return
+
+            join_deadline = room.get("join_deadline")
+            if join_deadline is None:
+                return
+
+            remaining = join_deadline - int(time.time())
+            if remaining <= 0:
+                try:
+                    GameLogic.start_room_controller(room_code)
+                except HTTPException:
+                    return
+                return
+
+            time.sleep(min(remaining, 1))
+
+    @staticmethod
+    def _ensure_room_started_if_ready(room_code: str, room: dict):
+        join_deadline = room.get("join_deadline")
+
+        if (
+            room.get("status") == "waiting"
+            and join_deadline is not None
+            and int(time.time()) >= join_deadline
+        ):
+            GameLogic.start_room_controller(room_code)
+            updated_room_data = redis_client.get(f"Room:{room_code}")
+            if not updated_room_data:
+                raise HTTPException(status_code=404, detail="Room not found.")
+            return json.loads(updated_room_data)
+
+        return room
 
     @staticmethod
     def submit_room_controller(payload: RoomSubmitRequest, username: str):
@@ -462,44 +533,32 @@ class GameLogic:
         room_data_str = redis_client.get(redis_key)
 
         if not room_data_str:
-            raise HTTPException(status_code=404, detail="Oopsie! Room not found. 🥺")
+            raise HTTPException(status_code=404, detail="Room not found.")
 
         room = json.loads(room_data_str)
+        room = GameLogic._ensure_room_started_if_ready(payload.room_code, room)
 
-        # 1. Are they actually in the room?
         if username not in room["players"]:
-            raise HTTPException(
-                status_code=403, detail="You are not in this match, silly!"
-            )
+            raise HTTPException(status_code=403, detail="You are not in this match.")
 
-        # 2. Is the clock ticking?
         if room["status"] != "in_progress":
-            raise HTTPException(
-                status_code=400, detail="The match isn't running right now! ⏱️"
-            )
+            raise HTTPException(status_code=400, detail="The match isn't running right now.")
 
-        # 3. Does the question exist?
         question = next(
             (q for q in room["questions"] if q.get("id") == payload.question_id), None
         )
         if not question:
-            raise HTTPException(
-                status_code=404, detail="Question not found in this session."
-            )
+            raise HTTPException(status_code=404, detail="Question not found in this session.")
 
-        # 4. Have they already solved it? We use a fast Redis Set for this!
         solved_key = f"Room:{payload.room_code}:solved:{username}"
         if redis_client.sismember(solved_key, payload.question_id):
             return {
                 "status": "Already Solved",
-                "message": "You already solved this one, smarty! 🧠",
+                "message": "You already solved this question.",
             }
 
-        # 5. Push to a NEW multiplayer Celery worker! (We will write this next)
         test_cases = question.get("test_cases", [])
-
-        # We give a flat 10 points per question!
-        execute_room_code_task.delay(
+        result_payload = execute_room_code_task(
             payload.room_code,
             username,
             payload.question_id,
@@ -508,11 +567,11 @@ class GameLogic:
             test_cases,
         )
 
-        # Return instantly while Docker does the heavy lifting in the background!
         return {
             "success": True,
-            "status": "Processing",
-            "message": "Code sent to the judge! Fingers crossed!",
+            "status": result_payload.get("execution_details", {}).get("status", "Processed"),
+            "message": "Code judged successfully.",
+            "execution_details": result_payload.get("execution_details"),
         }
 
     @staticmethod

@@ -4,6 +4,10 @@ export default function Timer({ initialSeconds, onTimeUp }) {
   const [timeLeft, setTimeLeft] = useState(initialSeconds);
 
   useEffect(() => {
+    setTimeLeft(initialSeconds);
+  }, [initialSeconds]);
+
+  useEffect(() => {
     if (timeLeft <= 0) {
       onTimeUp();
       return;
