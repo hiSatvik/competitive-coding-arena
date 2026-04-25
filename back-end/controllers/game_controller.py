@@ -13,6 +13,7 @@ from redis import Redis
 
 from models.schema import Code, RoomSubmitRequest
 from services.code_executor import execute_cpp_code
+from services.get_problems import load_competitive_problems
 
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
@@ -25,6 +26,8 @@ celery_app = Celery(
 )
 
 ROOM_JOIN_WINDOW_SECONDS = 120
+MATCH_DURATION_SECONDS = 1800
+QUESTIONS_PER_MATCH = 5
 
 
 def _publish_execution_update(game_id: str, payload: dict) -> None:
@@ -97,21 +100,33 @@ def execute_room_code_task(
     execution_result = execute_cpp_code(code, test_cases)
     is_success = execution_result.get("status") == "Accepted"
 
+    room_key = f"Room:{room_code}"
+    room_data_str = redis_client.get(room_key)
+    if not room_data_str:
+        return {
+            "type": "SUBMISSION_UPDATE",
+            "username": username,
+            "question_id": question_id,
+            "success": False,
+            "execution_details": {
+                "status": "Room Error",
+                "error": "Room no longer exists.",
+            },
+            "leaderboard": [],
+            "message": "Room no longer exists.",
+        }
+
+    room = json.loads(room_data_str)
     leaderboard_key = f"Room:{room_code}:leaderboard"
     solved_key = f"Room:{room_code}:solved:{username}"
 
     if is_success:
         redis_client.sadd(solved_key, question_id)
-        redis_client.expire(solved_key, 1800)
-
+        redis_client.expire(solved_key, MATCH_DURATION_SECONDS)
         redis_client.zincrby(leaderboard_key, points, username)
-        redis_client.expire(leaderboard_key, 1800)
+        redis_client.expire(leaderboard_key, MATCH_DURATION_SECONDS)
 
-    raw_leaderboard = redis_client.zrevrange(leaderboard_key, 0, -1, withscores=True)
-    leaderboard = [
-        {"username": member, "score": int(score)} for member, score in raw_leaderboard
-    ]
-
+    leaderboard = GameLogic._build_room_leaderboard(room_code, room["players"])
     result_payload = {
         "type": "SUBMISSION_UPDATE",
         "username": username,
@@ -123,111 +138,30 @@ def execute_room_code_task(
     }
 
     _publish_room_update(room_code, result_payload)
+
+    total_questions = len(room.get("questions", []))
+    solved_count = cast(int, redis_client.scard(solved_key))
+    if (
+        is_success
+        and room.get("status") == "in_progress"
+        and total_questions > 0
+        and solved_count >= total_questions
+    ):
+        GameLogic._finalize_room(
+            room_code,
+            room,
+            winner_usernames=[username],
+            winner_reason="completed_all_first",
+        )
+
     return result_payload
-
-
-dummy_questions = [
-    {
-        "id": "q1",
-        "title": "Add Two Numbers",
-        "difficulty": "Easy",
-        "constraints": [
-            "Inputs are integers",
-            "Values can be positive, negative, or zero",
-            "Time Complexity: O(1)",
-        ],
-        "description": "Write a program that reads two space-separated integers from standard input and prints their sum.",
-        "starter_code": """#include <iostream>
-using namespace std;
-
-int solve(int a, int b) {
-    // Write your logic here
-    
-}
-
-int main() {
-    int a, b;
-    if (cin >> a >> b) {
-        cout << solve(a, b);
-    }
-    return 0;
-}""",
-        "test_cases": [
-            {"input": "5 7\n", "expected_output": "12"},
-            {"input": "10 20\n", "expected_output": "30"},
-            {"input": "-5 5\n", "expected_output": "0"},
-        ],
-    },
-    {
-        "id": "q2",
-        "title": "Multiply by Two",
-        "difficulty": "Easy",
-        "constraints": [
-            "Input is an integer",
-            "Value can be positive, negative, or zero",
-            "Time Complexity: O(1)",
-        ],
-        "description": "Write a program that reads a single integer from standard input and prints double its value.",
-        "starter_code": """#include <iostream>
-using namespace std;
-
-int solve(int n) {
-    // Write your logic here
-    
-}
-
-int main() {
-    int n;
-    if (cin >> n) {
-        cout << solve(n);
-    }
-    return 0;
-}""",
-        "test_cases": [
-            {"input": "4\n", "expected_output": "8"},
-            {"input": "0\n", "expected_output": "0"},
-            {"input": "-15\n", "expected_output": "-30"},
-        ],
-    },
-    {
-        "id": "q3",
-        "title": "Find the Maximum",
-        "difficulty": "Easy",
-        "constraints": [
-            "Inputs are three integers",
-            "Values can be positive, negative, or zero",
-            "Time Complexity: O(1)",
-        ],
-        "description": "Write a program that reads three space-separated integers and prints the largest one.",
-        "starter_code": """#include <iostream>
-using namespace std;
-
-int solve(int a, int b, int c) {
-    // Write your logic here
-    
-}
-
-int main() {
-    int a, b, c;
-    if (cin >> a >> b >> c) {
-        cout << solve(a, b, c);
-    }
-    return 0;
-}""",
-        "test_cases": [
-            {"input": "1 5 3\n", "expected_output": "5"},
-            {"input": "10 10 10\n", "expected_output": "10"},
-            {"input": "-1 -5 -3\n", "expected_output": "-1"},
-        ],
-    },
-]
 
 
 class GameLogic:
     def __init__(self, username: str):
         self.game_id = str(uuid.uuid4())
         self.username = username
-        self.questions = dummy_questions
+        self.questions = load_competitive_problems(count=QUESTIONS_PER_MATCH)
 
         game_data = {
             "game_id": self.game_id,
@@ -238,7 +172,7 @@ class GameLogic:
             "solved_questions": [],
         }
 
-        redis_client.setex(f"Game:{self.game_id}", 1800, json.dumps(game_data))
+        redis_client.setex(f"Game:{self.game_id}", MATCH_DURATION_SECONDS, json.dumps(game_data))
 
     def start_game_controller(self):
         return {
@@ -350,17 +284,21 @@ class GameLogic:
     def create_room_controller(username: str):
         room_code = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
         join_deadline = int(time.time()) + ROOM_JOIN_WINDOW_SECONDS
+        questions = load_competitive_problems(count=QUESTIONS_PER_MATCH)
 
         room_data = {
             "room_code": room_code,
             "status": "waiting",
             "players": [username],
-            "questions": dummy_questions,
+            "questions": questions,
             "start_time": None,
             "join_deadline": join_deadline,
+            "winner_usernames": [],
+            "winner_reason": None,
+            "completed_at": None,
         }
 
-        redis_client.setex(f"Room:{room_code}", 1800, json.dumps(room_data))
+        redis_client.setex(f"Room:{room_code}", MATCH_DURATION_SECONDS, json.dumps(room_data))
         threading.Thread(
             target=GameLogic._auto_start_room_after_deadline,
             args=(room_code,),
@@ -374,6 +312,7 @@ class GameLogic:
             "questions": room_data["questions"],
             "status": room_data["status"],
             "join_deadline": join_deadline,
+            "winner_usernames": [],
             "message": f"Room created successfully! Share {room_code} to invite users.",
         }
 
@@ -387,18 +326,10 @@ class GameLogic:
 
         room = json.loads(room_data_str)
         room = GameLogic._ensure_room_started_if_ready(room_code, room)
+        room = GameLogic._ensure_room_finished_if_ready(room_code, room)
 
         if room["status"] != "waiting":
-            return {
-                "room_code": room["room_code"],
-                "username": username,
-                "players": room["players"],
-                "questions": room["questions"],
-                "status": room["status"],
-                "join_deadline": room.get("join_deadline"),
-                "start_time": room.get("start_time"),
-                "message": "The game has already started.",
-            }
+            return GameLogic._serialize_room_state(room, username)
 
         if username not in room["players"]:
             room["players"].append(username)
@@ -418,16 +349,7 @@ class GameLogic:
                 },
             )
 
-        return {
-            "room_code": room_code,
-            "username": username,
-            "players": room["players"],
-            "questions": room["questions"],
-            "status": room["status"],
-            "join_deadline": room.get("join_deadline"),
-            "start_time": room.get("start_time"),
-            "message": "Welcome to the room!",
-        }
+        return GameLogic._serialize_room_state(room, username)
 
     @staticmethod
     def get_room_controller(room_code: str, username: str):
@@ -439,15 +361,8 @@ class GameLogic:
 
         room = json.loads(room_data_str)
         room = GameLogic._ensure_room_started_if_ready(room_code, room)
-        return {
-            "room_code": room["room_code"],
-            "username": username,
-            "players": room["players"],
-            "questions": room["questions"],
-            "status": room["status"],
-            "join_deadline": room.get("join_deadline"),
-            "start_time": room.get("start_time"),
-        }
+        room = GameLogic._ensure_room_finished_if_ready(room_code, room)
+        return GameLogic._serialize_room_state(room, username)
 
     @staticmethod
     def start_room_controller(room_code: str):
@@ -528,6 +443,111 @@ class GameLogic:
         return room
 
     @staticmethod
+    def _ensure_room_finished_if_ready(room_code: str, room: dict):
+        start_time = room.get("start_time")
+
+        if room.get("status") == "completed":
+            return room
+
+        if (
+            room.get("status") == "in_progress"
+            and start_time is not None
+            and int(time.time()) >= start_time + MATCH_DURATION_SECONDS
+        ):
+            return GameLogic._finalize_room(room_code, room)
+
+        return room
+
+    @staticmethod
+    def _build_room_leaderboard(room_code: str, players: list[str]):
+        leaderboard_key = f"Room:{room_code}:leaderboard"
+        leaderboard = []
+
+        for player in players:
+            raw_score = redis_client.zscore(leaderboard_key, player)
+            solved_count = cast(int, redis_client.scard(f"Room:{room_code}:solved:{player}"))
+            leaderboard.append(
+                {
+                    "username": player,
+                    "score": int(raw_score or 0),
+                    "solved_count": solved_count,
+                    "time": 0,
+                }
+            )
+
+        leaderboard.sort(
+            key=lambda entry: (-entry["solved_count"], -entry["score"], entry["username"])
+        )
+        return leaderboard
+
+    @staticmethod
+    def _finalize_room(
+        room_code: str,
+        room: dict,
+        winner_usernames: list[str] | None = None,
+        winner_reason: str = "highest_solved_at_timeout",
+    ):
+        if room.get("status") == "completed":
+            return room
+
+        leaderboard = GameLogic._build_room_leaderboard(room_code, room["players"])
+
+        if winner_usernames is None:
+            highest_solved = max(
+                (entry["solved_count"] for entry in leaderboard),
+                default=0,
+            )
+            winner_usernames = [
+                entry["username"]
+                for entry in leaderboard
+                if entry["solved_count"] == highest_solved
+            ]
+
+        room["status"] = "completed"
+        room["winner_usernames"] = winner_usernames
+        room["winner_reason"] = winner_reason
+        room["completed_at"] = int(time.time())
+
+        redis_key = f"Room:{room_code}"
+        time_left = cast(int, redis_client.ttl(redis_key))
+        if time_left > 0:
+            redis_client.setex(redis_key, time_left, json.dumps(room))
+
+        winner_text = ", ".join(winner_usernames) if winner_usernames else "No winners"
+        _publish_room_update(
+            room_code,
+            {
+                "type": "MATCH_COMPLETED",
+                "room_code": room_code,
+                "leaderboard": leaderboard,
+                "winner_usernames": winner_usernames,
+                "winner_reason": winner_reason,
+                "completed_at": room["completed_at"],
+                "message": f"Match completed. Winner(s): {winner_text}",
+            },
+        )
+        return room
+
+    @staticmethod
+    def _serialize_room_state(room: dict, username: str):
+        return {
+            "room_code": room["room_code"],
+            "username": username,
+            "players": room["players"],
+            "questions": room["questions"],
+            "status": room["status"],
+            "join_deadline": room.get("join_deadline"),
+            "start_time": room.get("start_time"),
+            "leaderboard": GameLogic._build_room_leaderboard(
+                room["room_code"], room["players"]
+            ),
+            "winner_usernames": room.get("winner_usernames", []),
+            "winner_reason": room.get("winner_reason"),
+            "completed_at": room.get("completed_at"),
+            "match_duration_seconds": MATCH_DURATION_SECONDS,
+        }
+
+    @staticmethod
     def submit_room_controller(payload: RoomSubmitRequest, username: str):
         redis_key = f"Room:{payload.room_code}"
         room_data_str = redis_client.get(redis_key)
@@ -537,9 +557,18 @@ class GameLogic:
 
         room = json.loads(room_data_str)
         room = GameLogic._ensure_room_started_if_ready(payload.room_code, room)
+        room = GameLogic._ensure_room_finished_if_ready(payload.room_code, room)
 
         if username not in room["players"]:
             raise HTTPException(status_code=403, detail="You are not in this match.")
+
+        if room["status"] == "completed":
+            return {
+                "success": False,
+                "status": "Completed",
+                "message": "The match is already over.",
+                "winner_usernames": room.get("winner_usernames", []),
+            }
 
         if room["status"] != "in_progress":
             raise HTTPException(status_code=400, detail="The match isn't running right now.")
@@ -576,4 +605,4 @@ class GameLogic:
 
     @staticmethod
     def send_problems():
-        return dummy_questions
+        return load_competitive_problems(count=QUESTIONS_PER_MATCH)

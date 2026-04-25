@@ -27,12 +27,24 @@ export default function RoomArena() {
   const questions = room?.questions ?? [];
   const problem = questions[currentQuestionIndex] ?? null;
   const matchInitialSeconds = room?.start_time
-    ? Math.max(1800 - Math.floor(Date.now() / 1000 - room.start_time), 0)
-    : 1800;
+    ? Math.max((room?.match_duration_seconds ?? 1800) - Math.floor(Date.now() / 1000 - room.start_time), 0)
+    : room?.match_duration_seconds ?? 1800;
   const myScore = useMemo(
     () => leaderboard.find((entry) => entry.username === username)?.score ?? 0,
     [leaderboard, username]
   );
+
+  const buildWinnerMessage = (winnerUsernames = [], reason) => {
+    if (!winnerUsernames.length) {
+      return "The match finished without a winner.";
+    }
+
+    const names = winnerUsernames.join(", ");
+    if (reason === "completed_all_first") {
+      return `${names} solved all 5 problems first and won the match.`;
+    }
+    return `${names} finished with the highest solved count. Ties are allowed.`;
+  };
 
   useEffect(() => {
     questionsRef.current = questions;
@@ -57,13 +69,17 @@ export default function RoomArena() {
         setRoom(response.data);
         setUsername(response.data.username);
         setCode(response.data.questions?.[0]?.starter_code ?? "");
-        setLeaderboard(
-          (response.data.players ?? []).map((playerName) => ({
-            username: playerName,
-            score: 0,
-            time: 0,
-          }))
-        );
+        setLeaderboard(response.data.leaderboard ?? []);
+
+        if (response.data.status === "completed") {
+          setConsoleOutput({
+            status: "Completed",
+            message: buildWinnerMessage(
+              response.data.winner_usernames,
+              response.data.winner_reason
+            ),
+          });
+        }
       } catch (err) {
         console.error("Failed to load room arena:", err);
       }
@@ -102,6 +118,26 @@ export default function RoomArena() {
           setIsEvaluating(false);
         }
       }
+
+      if (data.type === "MATCH_COMPLETED") {
+        setLeaderboard(data.leaderboard ?? []);
+        setRoom((current) =>
+          current
+            ? {
+                ...current,
+                status: "completed",
+                winner_usernames: data.winner_usernames ?? [],
+                winner_reason: data.winner_reason,
+                completed_at: data.completed_at,
+              }
+            : current
+        );
+        setConsoleOutput({
+          status: "Completed",
+          message: buildWinnerMessage(data.winner_usernames, data.winner_reason),
+        });
+        setIsEvaluating(false);
+      }
     };
 
     return () => {
@@ -111,6 +147,14 @@ export default function RoomArena() {
 
   const handleSubmit = async () => {
     if (!problem) return;
+
+    if (room?.status === "completed") {
+      setConsoleOutput({
+        status: "Completed",
+        message: buildWinnerMessage(room?.winner_usernames, room?.winner_reason),
+      });
+      return;
+    }
 
     setIsEvaluating(true);
     setConsoleOutput({ status: "Evaluating", message: "Submitting to the room judge..." });
@@ -155,7 +199,24 @@ export default function RoomArena() {
           <Timer
             key={`${roomCode}-${room?.start_time ?? "pending"}`}
             initialSeconds={matchInitialSeconds}
-            onTimeUp={() => navigate("/lobby")}
+            onTimeUp={async () => {
+              try {
+                const response = await axios.get(`http://localhost:8000/game/room/${roomCode}`, {
+                  withCredentials: true,
+                });
+                setRoom(response.data);
+                setLeaderboard(response.data.leaderboard ?? []);
+                setConsoleOutput({
+                  status: "Completed",
+                  message: buildWinnerMessage(
+                    response.data.winner_usernames,
+                    response.data.winner_reason
+                  ),
+                });
+              } catch (err) {
+                navigate("/lobby");
+              }
+            }}
           />
         </div>
         <button

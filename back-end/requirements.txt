@@ -9,4 +9,4 @@ python-jose
 docker
 itsdangerous
 celery
-google
+google-genai
